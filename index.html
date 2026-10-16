@@ -1,0 +1,2050 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NECRO-VOID // Software 3D Engine</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+body, html {
+width: 100%; height: 100%;
+background-color: #050508;
+display: flex; justify-content: center; align-items: center;
+overflow: hidden; font-family: 'Courier New', Courier, monospace;
+}
+#game-container {
+position: relative;
+display: flex; justify-content: center; align-items: center;
+box-shadow: 0 0 40px rgba(0, 255, 200, 0.15);
+border: 2px solid #1a2634;
+}
+canvas {
+display: block;
+image-rendering: pixelated;
+image-rendering: crisp-edges;
+cursor: crosshair;
+}
+</style>
+</head>
+<body>
+<div id="game-container">
+<canvas id="screen"></canvas>
+</div>
+
+<script>
+"use strict";
+
+/**
+* ============================================================================
+* 1. MATH, PRNG & PROCEDURAL NOISE UTILITIES
+* ============================================================================
+*/
+class PRNG {
+constructor(seed = 1337) {
+this.seed = seed >>> 0;
+}
+next() {
+let t = (this.seed += 0x6D2B79F5);
+t = Math.imul(t ^ (t >>> 15), t | 1);
+t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+range(min, max) {
+return min + this.next() * (max - min);
+}
+int(min, max) {
+return Math.floor(this.range(min, max + 1));
+}
+}
+
+class NoiseGenerator {
+constructor(seed = 42) {
+this.rng = new PRNG(seed);
+this.p = new Uint8Array(512);
+const perm = new Uint8Array(256);
+for (let i = 0; i < 256; i++) perm[i] = i;
+for (let i = 255; i > 0; i--) {
+const j = this.rng.int(0, i);
+const tmp = perm[i];
+perm[i] = perm[j];
+perm[j] = tmp;
+}
+for (let i = 0; i < 512; i++) this.p[i] = perm[i & 255];
+}
+fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+lerp(t, a, b) { return a + t * (b - a); }
+grad(hash, x, y) {
+const h = hash & 7;
+const u = h < 4 ? x : y;
+const v = h < 4 ? y : x;
+return ((h & 1) !== 0 ? -u : u) + ((h & 2) !== 0 ? -2.0 * v : 2.0 * v);
+}
+perlin2D(x, y) {
+const X = Math.floor(x) & 255;
+const Y = Math.floor(y) & 255;
+x -= Math.floor(x);
+y -= Math.floor(y);
+const u = this.fade(x);
+const v = this.fade(y);
+const A = this.p[X] + Y, B = this.p[X + 1] + Y;
+const res = this.lerp(v,
+this.lerp(u, this.grad(this.p[A], x, y), this.grad(this.p[B], x - 1, y)),
+this.lerp(u, this.grad(this.p[A + 1], x, y - 1), this.grad(this.p[B + 1], x - 1, y - 1))
+);
+return (res + 1) * 0.5;
+}
+fbm(x, y, octaves = 4) {
+let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
+for (let i = 0; i < octaves; i++) {
+total += this.perlin2D(x * frequency, y * frequency) * amplitude;
+maxValue += amplitude;
+amplitude *= 0.5;
+frequency *= 2;
+}
+return total / maxValue;
+}
+}
+
+/**
+* ============================================================================
+* 2. PROCEDURAL TEXTURE & SPRITE GENERATOR
+* ============================================================================
+*/
+const TEX_SIZE = 64;
+
+class AssetManager {
+constructor() {
+this.noise = new NoiseGenerator(9001);
+this.textures = []; // Uint32Array (ABGR format for little-endian ImageData)
+this.sprites = {};
+this.generateAll();
+}
+
+packColor(r, g, b, a = 255) {
+r = Math.max(0, Math.min(255, r | 0));
+g = Math.max(0, Math.min(255, g | 0));
+b = Math.max(0, Math.min(255, b | 0));
+a = Math.max(0, Math.min(255, a | 0));
+return ((a << 24) | (b << 16) | (g << 8) | r) >>> 0;
+}
+
+generateAll() {
+// Texture 0: Empty
+this.textures[0] = new Uint32Array(TEX_SIZE * TEX_SIZE);
+
+// Texture 1: Tech Stone Bricks
+this.textures[1] = this.createTexture((x, y) => {
+const n = this.noise.fbm(x * 0.12, y * 0.12, 3);
+const brickRow = (y >> 4);
+const offset = (brickRow & 1) * 16;
+const bx = (x + offset) & 31;
+const by = y & 15;
+const mortar = (bx === 0 || by === 0);
+let base = mortar ? 25 : 65 + n * 75;
+if (!mortar && (by === 1 || bx === 1)) base += 25;
+if (!mortar && (by === 15 || bx === 31)) base -= 25;
+return this.packColor(base * 0.85, base * 0.92, base * 1.05);
+});
+
+// Texture 2: Rusty Cyber Panel with Glowing Strip
+this.textures[2] = this.createTexture((x, y) => {
+const n = this.noise.fbm(x * 0.15, y * 0.15, 4);
+const border = (x < 3 || x > 60 || y < 3 || y > 60);
+const rivet = ((x === 5 || x === 58) && (y % 16 === 5));
+let r = 75 + n * 55, g = 65 + n * 45, b = 60 + n * 40;
+if (border) { r *= 0.45; g *= 0.45; b *= 0.45; }
+if (rivet) { r = 170; g = 170; b = 180; }
+// Hazard / Neon core line
+if (y > 27 && y < 36) {
+const stripe = ((x + y) & 8) !== 0;
+if (stripe) { r = 240; g = 180; b = 20; }
+else { r = 25; g = 25; b = 25; }
+}
+return this.packColor(r, g, b);
+});
+
+// Texture 3: Glowing Alien Circuit Wall
+this.textures[3] = this.createTexture((x, y) => {
+const n = this.noise.perlin2D(x * 0.1, y * 0.1);
+const grid = (x % 16 === 0 || y % 16 === 0);
+const pulse = Math.sin(x * 0.2) * Math.cos(y * 0.2) > 0.45;
+let r = 20 + n * 25, g = 35 + n * 35, b = 55 + n * 45;
+if (grid && n > 0.38) { r = 20; g = 230; b = 210; }
+else if (pulse) { r = 0; g = 170; b = 255; }
+return this.packColor(r, g, b);
+});
+
+// Texture 4: Crimson Flesh / Reactor Wall
+this.textures[4] = this.createTexture((x, y) => {
+const n = this.noise.fbm(x * 0.09, y * 0.09, 4);
+const veins = Math.abs(this.noise.perlin2D(x * 0.14, y * 0.14) - 0.5) < 0.045;
+let r = 80 + n * 95, g = 18 + n * 25, b = 28 + n * 35;
+if (veins) { r = 255; g = 90; b = 40; }
+return this.packColor(r, g, b);
+});
+
+// Texture 5: Exit Portal Wall
+this.textures[5] = this.createTexture((x, y) => {
+const dx = x - 32, dy = y - 32;
+const dist = Math.sqrt(dx * dx + dy * dy);
+const angle = Math.atan2(dy, dx);
+const swirl = Math.sin(dist * 0.35 - angle * 3);
+if (dist < 26) {
+const c = (swirl + 1) * 0.5;
+return this.packColor(40 + c * 150, 180 + c * 75, 255);
+}
+const n = this.noise.perlin2D(x * 0.2, y * 0.2);
+return this.packColor(40 + n * 40, 50 + n * 40, 70 + n * 40);
+});
+
+// Texture 6: Floor Tile
+this.textures[6] = this.createTexture((x, y) => {
+const n = this.noise.perlin2D(x * 0.18, y * 0.18);
+const edge = (x % 32 === 0 || y % 32 === 0);
+const diag = ((x & 31) === (y & 31)) && (x % 8 === 0);
+let v = edge ? 22 : 42 + n * 28;
+if (diag) v += 15;
+return this.packColor(v * 0.85, v * 0.95, v * 1.15);
+});
+
+// Texture 7: Ceiling Grate
+this.textures[7] = this.createTexture((x, y) => {
+const beam = (x % 32 < 4 || y % 32 < 4);
+const n = this.noise.perlin2D(x * 0.25, y * 0.25);
+let v = beam ? 45 : 18 + n * 16;
+return this.packColor(v * 0.9, v * 0.9, v);
+});
+
+// Generate Entity & Item Sprites
+this.sprites.grunt = this.createEnemySprite(230, 65, 45, 1);
+this.sprites.stalker = this.createEnemySprite(50, 220, 110, 2);
+this.sprites.boss = this.createEnemySprite(180, 50, 240, 3);
+this.sprites.health = this.createPickupSprite('health');
+this.sprites.ammo = this.createPickupSprite('ammo');
+this.sprites.Weapon = this.createPickupSprite('weapon');
+this.sprites.pillar = this.createPillarSprite();
+this.sprites.portal = this.createPortalSprite();
+this.sprites.projPlayer = this.createOrbSprite(60, 240, 255);
+this.sprites.projEnemy = this.createOrbSprite(255, 100, 30);
+}
+
+createTexture(fn) {
+const data = new Uint32Array(TEX_SIZE * TEX_SIZE);
+for (let y = 0; y < TEX_SIZE; y++) {
+for (let x = 0; x < TEX_SIZE; x++) {
+data[y * TEX_SIZE + x] = fn(x, y);
+}
+}
+return data;
+}
+
+createEnemySprite(rBase, gBase, bBase, variant) {
+return this.createTexture((x, y) => {
+const dx = (x - 32) / 32;
+const dy = (y - 32) / 32;
+const dist = Math.sqrt(dx * dx + dy * dy);
+const n = this.noise.perlin2D(x * 0.2, y * 0.2);
+
+// Cyber-Demon / Drone Silhouette
+const head = (dx * dx + (dy + 0.35) * (dy + 0.35)) < 0.14;
+const torso = Math.abs(dx) < (0.38 - Math.abs(dy) * 0.25) && dy > -0.25 && dy < 0.55;
+const shoulders = Math.abs(dx) < 0.58 && dy > -0.22 && dy < 0.08;
+const legs = (Math.abs(Math.abs(dx) - 0.18) < 0.1) && dy >= 0.5 && dy < 0.92;
+const horns = variant >= 2 && Math.abs(dx) > 0.2 && Math.abs(dx) < 0.48 && dy < -0.25 && dy > -0.65 && (Math.abs(dx) + dy < 0.1);
+
+if (!(head || torso || shoulders || legs || horns)) return 0;
+
+// Glowing Eyes / Visor
+if (dy > -0.42 && dy < -0.28 && Math.abs(dx) > 0.06 && Math.abs(dx) < 0.24) {
+return this.packColor(255, 255, 120);
+}
+// Chest Core
+if (dx * dx + (dy - 0.05) * (dy - 0.05) < 0.035) {
+return this.packColor(120, 255, 255);
+}
+
+const shade = (1.0 - dist * 0.65) * (0.7 + n * 0.6);
+const outline = (Math.abs(dx) > 0.52 || dy > 0.86) ? 0.4 : 1.0;
+return this.packColor(rBase * shade * outline, gBase * shade * outline, bBase * shade * outline);
+});
+}
+
+createPickupSprite(type) {
+return this.createTexture((x, y) => {
+if (x < 14 || x > 50 || y < 22 || y > 58) return 0;
+const border = (x < 17 || x > 47 || y < 25 || y > 55);
+if (type === 'health') {
+if (border) return this.packColor(180, 190, 200);
+const cross = (Math.abs(x - 32) < 4 && Math.abs(y - 40) < 11) ||
+(Math.abs(x - 32) < 11 && Math.abs(y - 40) < 4);
+if (cross) return this.packColor(240, 30, 40);
+return this.packColor(235, 240, 245);
+} else if (type === 'ammo') {
+if (border) return this.packColor(40, 60, 40);
+const stripe = (y > 36 && y < 44);
+if (stripe) return this.packColor(240, 200, 40);
+return this.packColor(65, 110, 55);
+} else {
+if (border) return this.packColor(80, 40, 120);
+const core = (Math.abs(x - 32) + Math.abs(y - 40)) < 12;
+if (core) return this.packColor(0, 255, 255);
+return this.packColor(140, 60, 220);
+}
+});
+}
+
+createPillarSprite() {
+return this.createTexture((x, y) => {
+const dx = Math.abs(x - 32);
+const width = (y < 10 || y > 54) ? 18 : 13;
+if (dx > width) return 0;
+const n = this.noise.perlin2D(x * 0.2, y * 0.2);
+const shade = 1.0 - (dx / width) * 0.65;
+// Glowing plasma tube inside pillar
+if (y >= 16 && y <= 48 && dx < 6) {
+return this.packColor(40, 220 * shade + 35, 255);
+}
+const c = (90 + n * 50) * shade;
+return this.packColor(c * 0.9, c, c * 1.1);
+});
+}
+
+createPortalSprite() {
+return this.createTexture((x, y) => {
+const dx = x - 32, dy = y - 32;
+const r = Math.sqrt(dx * dx + dy * dy);
+if (r > 28) return 0;
+const a = Math.atan2(dy, dx);
+const v = Math.sin(r * 0.45 - a * 4);
+const norm = 1 - r / 28;
+return this.packColor(
+80 + v * 80,
+200 * norm + 55,
+255
+);
+});
+}
+
+createOrbSprite(r, g, b) {
+return this.createTexture((x, y) => {
+const dx = x - 32, dy = y - 32;
+const dist = Math.sqrt(dx * dx + dy * dy);
+if (dist > 14) return 0;
+const t = 1 - (dist / 14);
+return this.packColor(
+r + (255 - r) * (t * t),
+g + (255 - g) * (t * t),
+b + (255 - b) * (t * t)
+);
+});
+}
+}
+
+/**
+* ============================================================================
+* 3. PROCEDURAL WEB AUDIO SYNTHESIZER & SOUND ENGINE
+* ============================================================================
+*/
+class SoundEngine {
+constructor() {
+this.ctx = null;
+this.masterGain = null;
+this.isPlayingMusic = false;
+this.step = 0;
+this.nextNoteTime = 0;
+this.tempo = 132;
+this.noiseBuffer = null;
+}
+
+init() {
+if (this.ctx) {
+if (this.ctx.state === 'suspended') this.ctx.resume();
+return;
+}
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+this.ctx = new AudioCtx();
+this.masterGain = this.ctx.createGain();
+this.masterGain.gain.value = 0.35;
+this.masterGain.connect(this.ctx.destination);
+
+// Pre-generate 1 second white noise buffer for percussion & explosions
+const sr = this.ctx.sampleRate;
+this.noiseBuffer = this.ctx.createBuffer(1, sr, sr);
+const output = this.noiseBuffer.getChannelData(0);
+for (let i = 0; i < sr; i++) {
+output[i] = Math.random() * 2 - 1;
+}
+
+this.isPlayingMusic = true;
+this.nextNoteTime = this.ctx.currentTime + 0.05;
+}
+
+updateMusic() {
+if (!this.ctx || !this.isPlayingMusic || this.ctx.state !== 'running') return;
+const secondsPer16th = (60.0 / this.tempo) * 0.25;
+while (this.nextNoteTime < this.ctx.currentTime + 0.12) {
+this.scheduleStep(this.step, this.nextNoteTime, secondsPer16th);
+this.nextNoteTime += secondsPer16th;
+this.step = (this.step + 1) & 31;
+}
+}
+
+scheduleStep(step, time, dur) {
+// Dark Cyberpunk / Doom D-Minor Phrygian Bassline
+const bassSeq = [
+73.42, 73.42, 0, 73.42, 77.78, 73.42, 0, 65.41,
+73.42, 73.42, 0, 73.42, 87.31, 82.41, 77.78, 65.41,
+73.42, 73.42, 0, 73.42, 77.78, 73.42, 0, 65.41,
+58.27, 58.27, 0, 65.41, 73.42, 0, 73.42, 0
+];
+const leadSeq = [
+293.66, 0, 349.23, 0, 311.13, 0, 293.66, 0,
+261.63, 0, 293.66, 349.23, 440.00, 0, 392.00, 0
+];
+
+const bFreq = bassSeq[step];
+if (bFreq > 0) {
+this.playSynthTone(bFreq, time, dur * 0.85, 'sawtooth', 0.16, 450);
+}
+
+if (step >= 16 && leadSeq[step - 16] > 0) {
+this.playSynthTone(leadSeq[step - 16], time, dur * 0.7, 'square', 0.07, 1400);
+}
+
+// Kick on 4-on-the-floor + syncopation
+if (step % 4 === 0 || step === 14 || step === 30) {
+this.playKick(time);
+}
+// Snare on backbeat
+if (step % 8 === 4) {
+this.playSnare(time);
+}
+// Hi-hat on offbeats
+if (step % 2 === 1) {
+this.playHiHat(time);
+}
+}
+
+playSynthTone(freq, time, dur, type, vol, cutoff) {
+const osc = this.ctx.createOscillator();
+const filter = this.ctx.createBiquadFilter();
+const gain = this.ctx.createGain();
+osc.type = type;
+osc.frequency.setValueAtTime(freq, time);
+
+filter.type = 'lowpass';
+filter.frequency.setValueAtTime(cutoff, time);
+filter.frequency.exponentialRampToValueAtTime(120, time + dur);
+
+gain.gain.setValueAtTime(vol, time);
+gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+
+osc.connect(filter);
+filter.connect(gain);
+gain.connect(this.masterGain);
+osc.start(time);
+osc.stop(time + dur);
+}
+
+playKick(time) {
+const osc = this.ctx.createOscillator();
+const gain = this.ctx.createGain();
+osc.frequency.setValueAtTime(130, time);
+osc.frequency.exponentialRampToValueAtTime(32, time + 0.11);
+gain.gain.setValueAtTime(0.35, time);
+gain.gain.exponentialRampToValueAtTime(0.001, time + 0.12);
+osc.connect(gain);
+gain.connect(this.masterGain);
+osc.start(time);
+osc.stop(time + 0.12);
+}
+
+playSnare(time) {
+const src = this.ctx.createBufferSource();
+src.buffer = this.noiseBuffer;
+const filter = this.ctx.createBiquadFilter();
+filter.type = 'highpass';
+filter.frequency.setValueAtTime(600, time);
+const gain = this.ctx.createGain();
+gain.gain.setValueAtTime(0.18, time);
+gain.gain.exponentialRampToValueAtTime(0.001, time + 0.12);
+src.connect(filter);
+filter.connect(gain);
+gain.connect(this.masterGain);
+src.start(time);
+src.stop(time + 0.12);
+}
+
+playHiHat(time) {
+const src = this.ctx.createBufferSource();
+src.buffer = this.noiseBuffer;
+const filter = this.ctx.createBiquadFilter();
+filter.type = 'highpass';
+filter.frequency.setValueAtTime(5000, time);
+const gain = this.ctx.createGain();
+gain.gain.setValueAtTime(0.05, time);
+gain.gain.exponentialRampToValueAtTime(0.001, time + 0.04);
+src.connect(filter);
+filter.connect(gain);
+gain.connect(this.masterGain);
+src.start(time);
+src.stop(time + 0.04);
+}
+
+sfxShoot(weaponType) {
+if (!this.ctx) return;
+const t = this.ctx.currentTime;
+if (weaponType === 0) {
+// Blaster
+const osc = this.ctx.createOscillator();
+const gain = this.ctx.createGain();
+osc.type = 'sawtooth';
+osc.frequency.setValueAtTime(750, t);
+osc.frequency.exponentialRampToValueAtTime(90, t + 0.14);
+gain.gain.setValueAtTime(0.3, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+osc.connect(gain);
+gain.connect(this.masterGain);
+osc.start(t);
+osc.stop(t + 0.14);
+} else if (weaponType === 1) {
+// Scatter Shotgun
+const src = this.ctx.createBufferSource();
+src.buffer = this.noiseBuffer;
+const filter = this.ctx.createBiquadFilter();
+filter.type = 'bandpass';
+filter.frequency.setValueAtTime(800, t);
+filter.frequency.exponentialRampToValueAtTime(180, t + 0.25);
+const gain = this.ctx.createGain();
+gain.gain.setValueAtTime(0.55, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+src.connect(filter);
+filter.connect(gain);
+gain.connect(this.masterGain);
+src.start(t);
+src.stop(t + 0.25);
+} else {
+// Plasma Rifle
+const osc = this.ctx.createOscillator();
+const gain = this.ctx.createGain();
+osc.type = 'square';
+osc.frequency.setValueAtTime(1100, t);
+osc.frequency.exponentialRampToValueAtTime(220, t + 0.09);
+gain.gain.setValueAtTime(0.24, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+osc.connect(gain);
+gain.connect(this.masterGain);
+osc.start(t);
+osc.stop(t + 0.09);
+}
+}
+
+sfxHit() {
+if (!this.ctx) return;
+const t = this.ctx.currentTime;
+const osc = this.ctx.createOscillator();
+const gain = this.ctx.createGain();
+osc.type = 'triangle';
+osc.frequency.setValueAtTime(190, t);
+osc.frequency.exponentialRampToValueAtTime(55, t + 0.08);
+gain.gain.setValueAtTime(0.3, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+osc.connect(gain);
+gain.connect(this.masterGain);
+osc.start(t);
+osc.stop(t + 0.08);
+}
+
+sfxExplosion() {
+if (!this.ctx) return;
+const t = this.ctx.currentTime;
+const src = this.ctx.createBufferSource();
+src.buffer = this.noiseBuffer;
+const filter = this.ctx.createBiquadFilter();
+filter.type = 'lowpass';
+filter.frequency.setValueAtTime(600, t);
+filter.frequency.exponentialRampToValueAtTime(60, t + 0.4);
+const gain = this.ctx.createGain();
+gain.gain.setValueAtTime(0.5, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+src.connect(filter);
+filter.connect(gain);
+gain.connect(this.masterGain);
+src.start(t);
+src.stop(t + 0.4);
+}
+
+sfxPickup() {
+if (!this.ctx) return;
+const t = this.ctx.currentTime;
+const osc = this.ctx.createOscillator();
+const gain = this.ctx.createGain();
+osc.type = 'sine';
+osc.frequency.setValueAtTime(523.25, t);
+osc.frequency.setValueAtTime(783.99, t + 0.06);
+osc.frequency.setValueAtTime(1046.50, t + 0.12);
+gain.gain.setValueAtTime(0.25, t);
+gain.gain.exponentialRampToValueAtTime(0.001, t + 0.24);
+osc.connect(gain);
+gain.connect(this.masterGain);
+osc.start(t);
+osc.stop(t + 0.24);
+}
+}
+
+/**
+* ============================================================================
+* 4. SPATIAL PARTITIONING HASH GRID & OBJECT POOLING
+* ============================================================================
+*/
+class SpatialHashGrid {
+constructor(cellSize = 2.0) {
+this.cellSize = cellSize;
+this.cells = new Map();
+}
+clear() {
+this.cells.clear();
+}
+_key(cx, cy) {
+return (cx << 16) ^ cy;
+}
+insert(entityId, x, y, radius) {
+const minX = Math.floor((x - radius) / this.cellSize);
+const maxX = Math.floor((x + radius) / this.cellSize);
+const minY = Math.floor((y - radius) / this.cellSize);
+const maxY = Math.floor((y + radius) / this.cellSize);
+for (let cy = minY; cy <= maxY; cy++) {
+for (let cx = minX; cx <= maxX; cx++) {
+const k = this._key(cx, cy);
+let bucket = this.cells.get(k);
+if (!bucket) {
+bucket = [];
+this.cells.set(k, bucket);
+}
+bucket.push(entityId);
+}
+}
+}
+query(x, y, radius) {
+const results = new Set();
+const minX = Math.floor((x - radius) / this.cellSize);
+const maxX = Math.floor((x + radius) / this.cellSize);
+const minY = Math.floor((y - radius) / this.cellSize);
+const maxY = Math.floor((y + radius) / this.cellSize);
+for (let cy = minY; cy <= maxY; cy++) {
+for (let cx = minX; cx <= maxX; cx++) {
+const bucket = this.cells.get(this._key(cx, cy));
+if (bucket) {
+for (let i = 0; i < bucket.length; i++) results.add(bucket[i]);
+}
+}
+}
+return results;
+}
+}
+
+class ParticlePool {
+constructor(maxParticles = 400) {
+this.max = maxParticles;
+this.active = new Uint8Array(maxParticles);
+this.x = new Float32Array(maxParticles);
+this.y = new Float32Array(maxParticles);
+this.z = new Float32Array(maxParticles);
+this.vx = new Float32Array(maxParticles);
+this.vy = new Float32Array(maxParticles);
+this.vz = new Float32Array(maxParticles);
+this.life = new Float32Array(maxParticles);
+this.maxLife = new Float32Array(maxParticles);
+this.color = new Uint32Array(maxParticles);
+this.size = new Float32Array(maxParticles);
+}
+
+spawn(x, y, z, vx, vy, vz, life, color, size = 0.08) {
+for (let i = 0; i < this.max; i++) {
+if (!this.active[i]) {
+this.active[i] = 1;
+this.x[i] = x; this.y[i] = y; this.z[i] = z;
+this.vx[i] = vx; this.vy[i] = vy; this.vz[i] = vz;
+this.life[i] = life; this.maxLife[i] = life;
+this.color[i] = color; this.size[i] = size;
+return;
+}
+}
+}
+
+burst(x, y, z, count, color, speed = 2.5, size = 0.09) {
+for (let i = 0; i < count; i++) {
+const ang = Math.random() * Math.PI * 2;
+const spd = (0.3 + Math.random() * 0.7) * speed;
+const vz = (Math.random() - 0.35) * speed * 0.8;
+this.spawn(
+x, y, z,
+Math.cos(ang) * spd, Math.sin(ang) * spd, vz,
+0.25 + Math.random() * 0.35, color, size
+);
+}
+}
+
+update(dt, map) {
+for (let i = 0; i < this.max; i++) {
+if (!this.active[i]) continue;
+this.life[i] -= dt;
+if (this.life[i] <= 0) {
+this.active[i] = 0;
+continue;
+}
+const nx = this.x[i] + this.vx[i] * dt;
+const ny = this.y[i] + this.vy[i] * dt;
+if (!map.isSolid(nx | 0, ny | 0)) {
+this.x[i] = nx;
+this.y[i] = ny;
+} else {
+this.vx[i] *= -0.5;
+this.vy[i] *= -0.5;
+}
+this.z[i] += this.vz[i] * dt;
+this.vz[i] -= 2.2 * dt; // Gravity
+if (this.z[i] < -0.45) {
+this.z[i] = -0.45;
+this.vz[i] *= -0.4;
+}
+}
+}
+}
+
+/**
+* ============================================================================
+* 5. ENTITY COMPONENT SYSTEM (ECS)
+* ============================================================================
+*/
+class ECS {
+constructor() {
+this.nextId = 1;
+this.entities = new Set();
+this.transform = new Map(); // { x, y, z, dirX, dirY, radius }
+this.velocity = new Map(); // { vx, vy, speed }
+this.health = new Map(); // { hp, maxHp, hitFlash }
+this.sprite = new Map(); // { texData, scale, zOffset }
+this.ai = new Map(); // { state, type, timer, cooldown, targetX, targetY, score }
+this.projectile = new Map(); // { owner, damage, life, color }
+this.pickup = new Map(); // { kind, value }
+this.light = new Map(); // { r, g, b, radius, flicker }
+this.collider = new Map(); // { solid, isEnemy, isPickup }
+this.toDestroy = new Set();
+}
+
+createEntity() {
+const id = this.nextId++;
+this.entities.add(id);
+return id;
+}
+
+destroyEntity(id) {
+this.toDestroy.add(id);
+}
+
+flushDestroyed() {
+for (const id of this.toDestroy) {
+this.entities.delete(id);
+this.transform.delete(id);
+this.velocity.delete(id);
+this.health.delete(id);
+this.sprite.delete(id);
+this.ai.delete(id);
+this.projectile.delete(id);
+this.pickup.delete(id);
+this.light.delete(id);
+this.collider.delete(id);
+}
+this.toDestroy.clear();
+}
+
+clear() {
+this.entities.clear();
+this.transform.clear();
+this.velocity.clear();
+this.health.clear();
+this.sprite.clear();
+this.ai.clear();
+this.projectile.clear();
+this.pickup.clear();
+this.light.clear();
+this.collider.clear();
+this.toDestroy.clear();
+this.nextId = 1;
+}
+}
+
+/**
+* ============================================================================
+* 6. PROCEDURAL DUNGEON GENERATOR & LIGHTING
+* ============================================================================
+*/
+class LevelMap {
+constructor(width = 40, height = 40) {
+this.width = width;
+this.height = height;
+this.grid = new Uint8Array(width * height);
+this.explored = new Uint8Array(width * height);
+this.lightR = new Float32Array(width * height);
+this.lightG = new Float32Array(width * height);
+this.lightB = new Float32Array(width * height);
+this.staticLights = [];
+this.rooms = [];
+}
+
+idx(x, y) { return y * this.width + x; }
+
+isSolid(x, y) {
+if (x < 0 || x >= this.width || y < 0 || y >= this.height) return true;
+return this.grid[y * this.width + x] > 0;
+}
+
+hasLineOfSight(x0, y0, x1, y1) {
+const dx = x1 - x0, dy = y1 - y0;
+const dist = Math.hypot(dx, dy);
+const steps = Math.ceil(dist * 4);
+for (let i = 1; i < steps; i++) {
+const t = i / steps;
+const cx = (x0 + dx * t) | 0;
+const cy = (y0 + dy * t) | 0;
+if (this.isSolid(cx, cy)) return false;
+}
+return true;
+}
+
+generate(levelNum, ecs, assets) {
+const rng = new PRNG(levelNum * 7919 + 101);
+this.grid.fill(1);
+this.explored.fill(0);
+this.staticLights = [];
+this.rooms = [];
+
+const numRooms = Math.min(18, 7 + levelNum * 2);
+const wallTypes = [1, 2, 3, 4];
+
+for (let i = 0; i < numRooms * 4 && this.rooms.length < numRooms; i++) {
+const w = rng.int(4, 8);
+const h = rng.int(4, 8);
+const rx = rng.int(2, this.width - w - 3);
+const ry = rng.int(2, this.height - h - 3);
+
+let overlap = false;
+for (const rm of this.rooms) {
+if (rx < rm.x + rm.w + 1 && rx + w + 1 > rm.x &&
+ry < rm.y + rm.h + 1 && ry + h + 1 > rm.y) {
+overlap = true;
+break;
+}
+}
+if (overlap) continue;
+
+const wallTex = wallTypes[this.rooms.length % wallTypes.length];
+// Paint surrounding walls with room theme texture
+for (let y = ry - 1; y <= ry + h; y++) {
+for (let x = rx - 1; x <= rx + w; x++) {
+if (y === ry - 1 || y === ry + h || x === rx - 1 || x === rx + w) {
+this.grid[this.idx(x, y)] = wallTex;
+} else {
+this.grid[this.idx(x, y)] = 0;
+}
+}
+}
+
+const cx = Math.floor(rx + w / 2) + 0.5;
+const cy = Math.floor(ry + h / 2) + 0.5;
+this.rooms.push({ x: rx, y: ry, w, h, cx, cy, theme: wallTex });
+
+// Add thematic room light
+const lightColors = [
+[0.6, 0.75, 1.0],
+[1.0, 0.75, 0.35],
+[0.2, 0.95, 0.9],
+[1.0, 0.35, 0.35]
+];
+const lc = lightColors[(wallTex - 1) % 4];
+this.staticLights.push({
+x: cx, y: cy,
+r: lc[0], g: lc[1], b: lc[2],
+radius: Math.max(w, h) * 0.95
+});
+}
+
+// Carve corridors connecting rooms
+for (let i = 1; i < this.rooms.length; i++) {
+const a = this.rooms[i - 1];
+const b = this.rooms[i];
+let cx = a.cx | 0, cy = a.cy | 0;
+const tx = b.cx | 0, ty = b.cy | 0;
+
+while (cx !== tx) {
+this.grid[this.idx(cx, cy)] = 0;
+cx += (tx > cx ? 1 : -1);
+}
+while (cy !== ty) {
+this.grid[this.idx(cx, cy)] = 0;
+cy += (ty > cy ? 1 : -1);
+}
+this.grid[this.idx(tx, ty)] = 0;
+}
+
+// Populate rooms with enemies, pickups, pillars, and exit portal
+for (let i = 1; i < this.rooms.length; i++) {
+const rm = this.rooms[i];
+const isLastRoom = (i === this.rooms.length - 1);
+
+if (isLastRoom) {
+// Spawn Exit Portal & Level Boss
+this.spawnPortal(ecs, assets, rm.cx, rm.cy);
+this.grid[this.idx(rm.cx | 0, rm.y - 1)] = 5;
+this.spawnEnemy(ecs, assets, rm.cx + 1.0, rm.cy, 'boss', levelNum);
+continue;
+}
+
+// Decorative Light Pillar in larger rooms
+if (rm.w >= 6 && rm.h >= 6 && rng.next() < 0.65) {
+this.spawnPillar(ecs, assets, rm.cx, rm.cy);
+}
+
+// Spawn Hostiles
+const enemyCount = rng.int(1, 2 + Math.floor(levelNum * 0.7));
+for (let e = 0; e < enemyCount; e++) {
+const ex = rm.x + 1 + rng.next() * (rm.w - 2);
+const ey = rm.y + 1 + rng.next() * (rm.h - 2);
+if (Math.hypot(ex - rm.cx, ey - rm.cy) < 0.9) continue;
+const type = rng.next() < 0.65 ? 'grunt' : 'stalker';
+this.spawnEnemy(ecs, assets, ex, ey, type, levelNum);
+}
+
+// Spawn Pickups
+if (rng.next() < 0.75) {
+const px = rm.x + 1 + rng.next() * (rm.w - 2);
+const py = rm.y + 1 + rng.next() * (rm.h - 2);
+const roll = rng.next();
+if (roll < 0.45) this.spawnPickup(ecs, assets, px, py, 'health', 30);
+else if (roll < 0.85) this.spawnPickup(ecs, assets, px, py, 'ammo', 20);
+else this.spawnPickup(ecs, assets, px, py, 'weapon', 1);
+}
+}
+
+return { startX: this.rooms[0].cx, startY: this.rooms[0].cy };
+}
+
+spawnEnemy(ecs, assets, x, y, type, levelNum) {
+const id = ecs.createEntity();
+const isBoss = type === 'boss';
+const isStalker = type === 'stalker';
+const scale = isBoss ? 1.15 : (isStalker ? 0.85 : 0.95);
+const hp = isBoss ? 160 + levelNum * 45 : (isStalker ? 35 + levelNum * 10 : 50 + levelNum * 12);
+const speed = isBoss ? 1.9 : (isStalker ? 3.2 : 2.1);
+
+ecs.transform.set(id, { x, y, z: 0, dirX: 1, dirY: 0, radius: 0.35 });
+ecs.velocity.set(id, { vx: 0, vy: 0, speed });
+ecs.health.set(id, { hp, maxHp: hp, hitFlash: 0 });
+ecs.sprite.set(id, {
+texData: assets.sprites[type],
+scale,
+zOffset: 0
+});
+ecs.ai.set(id, {
+state: 'PATROL',
+type,
+timer: Math.random() * 2,
+cooldown: 1.0,
+targetX: x,
+targetY: y,
+score: isBoss ? 500 : (isStalker ? 150 : 100)
+});
+ecs.collider.set(id, { solid: true, isEnemy: true, isPickup: false });
+}
+
+spawnPickup(ecs, assets, x, y, kind, value) {
+const id = ecs.createEntity();
+ecs.transform.set(id, { x, y, z: -0.25, dirX: 0, dirY: 0, radius: 0.35 });
+ecs.sprite.set(id, {
+texData: kind === 'health' ? assets.sprites.health : (kind === 'ammo' ? assets.sprites.ammo : assets.sprites.Weapon),
+scale: 0.55,
+zOffset: -0.2
+});
+ecs.pickup.set(id, { kind, value });
+ecs.collider.set(id, { solid: false, isEnemy: false, isPickup: true });
+}
+
+spawnPillar(ecs, assets, x, y) {
+const id = ecs.createEntity();
+ecs.transform.set(id, { x, y, z: 0, dirX: 0, dirY: 0, radius: 0.32 });
+ecs.sprite.set(id, { texData: assets.sprites.pillar, scale: 1.0, zOffset: 0 });
+ecs.collider.set(id, { solid: true, isEnemy: false, isPickup: false });
+ecs.light.set(id, { r: 0.2, g: 0.85, b: 1.0, radius: 4.5, flicker: true });
+}
+
+spawnPortal(ecs, assets, x, y) {
+const id = ecs.createEntity();
+ecs.transform.set(id, { x, y, z: 0, dirX: 0, dirY: 0, radius: 0.45 });
+ecs.sprite.set(id, { texData: assets.sprites.portal, scale: 1.0, zOffset: 0 });
+ecs.pickup.set(id, { kind: 'portal', value: 1 });
+ecs.collider.set(id, { solid: false, isEnemy: false, isPickup: true });
+ecs.light.set(id, { r: 0.3, g: 0.9, b: 1.0, radius: 6.5, flicker: true });
+}
+
+bakeLighting(ecs, player, muzzleFlash, time) {
+// Base ambient light
+this.lightR.fill(0.16);
+this.lightG.fill(0.18);
+this.lightB.fill(0.24);
+
+const applyLight = (lx, ly, r, g, b, rad) => {
+const minX = Math.max(0, Math.floor(lx - rad));
+const maxX = Math.min(this.width - 1, Math.ceil(lx + rad));
+const minY = Math.max(0, Math.floor(ly - rad));
+const maxY = Math.min(this.height - 1, Math.ceil(ly + rad));
+const radSq = rad * rad;
+
+for (let y = minY; y <= maxY; y++) {
+for (let x = minX; x <= maxX; x++) {
+const dx = (x + 0.5) - lx;
+const dy = (y + 0.5) - ly;
+const dSq = dx * dx + dy * dy;
+if (dSq < radSq) {
+const atten = 1.0 - Math.sqrt(dSq) / rad;
+const idx = y * this.width + x;
+this.lightR[idx] += r * atten;
+this.lightG[idx] += g * atten;
+this.lightB[idx] += b * atten;
+}
+}
+}
+};
+
+// Static Room Lights
+for (let i = 0; i < this.staticLights.length; i++) {
+const sl = this.staticLights[i];
+applyLight(sl.x, sl.y, sl.r * 0.65, sl.g * 0.65, sl.b * 0.65, sl.radius);
+}
+
+// Dynamic ECS Lights (Projectiles, Pillars, Portals)
+for (const [id, l] of ecs.light.entries()) {
+const tr = ecs.transform.get(id);
+if (!tr) continue;
+const flk = l.flicker ? (0.88 + 0.12 * Math.sin(time * 9 + id)) : 1.0;
+applyLight(tr.x, tr.y, l.r * flk, l.g * flk, l.b * flk, l.radius);
+}
+
+// Player Headlamp + Muzzle Flash
+const flashBoost = muzzleFlash * 1.4;
+applyLight(
+player.x, player.y,
+0.55 + flashBoost,
+0.6 + flashBoost * 0.85,
+0.65 + flashBoost * 0.4,
+5.5 + muzzleFlash * 4.5
+);
+}
+}
+
+/**
+* ============================================================================
+* 7. SOFTWARE 3D RAYCASTER & SPRITE RENDERING ENGINE
+* ============================================================================
+*/
+class SoftwareRenderer {
+constructor(canvas, assets) {
+this.canvas = canvas;
+this.ctx = canvas.getContext('2d', { alpha: false });
+this.assets = assets;
+this.width = 480;
+this.height = 270;
+this.canvas.width = this.width;
+this.canvas.height = this.height;
+
+this.imgData = this.ctx.createImageData(this.width, this.height);
+this.buf32 = new Uint32Array(this.imgData.data.buffer);
+this.zBuffer = new Float32Array(this.width);
+}
+
+renderWorld(player, map, ecs, particles, time) {
+const W = this.width;
+const H = this.height;
+const buf = this.buf32;
+
+const posX = player.x;
+const posY = player.y;
+const dirX = Math.cos(player.angle);
+const dirY = Math.sin(player.angle);
+const planeX = -dirY * 0.66;
+const planeY = dirX * 0.66;
+
+// Camera vertical bob & pitch offset
+const bobOffset = Math.sin(player.bobPhase) * 5.0 * player.moveSpeedRatio;
+const horizon = (H >> 1) + Math.floor(player.pitch + bobOffset);
+
+// ------------------------------------------------------------------------
+// A. FLOOR & CEILING HORIZONTAL SCANLINE CASTING
+// ------------------------------------------------------------------------
+const floorTex = this.assets.textures[6];
+const ceilTex = this.assets.textures[7];
+const rayDirX0 = dirX - planeX;
+const rayDirY0 = dirY - planeY;
+const rayDirX1 = dirX + planeX;
+const rayDirY1 = dirY + planeY;
+const posZ = 0.5 * H;
+
+for (let y = 0; y < H; y++) {
+const isFloor = y > horizon;
+const p = isFloor ? (y - horizon) : (horizon - y);
+if (p === 0) continue;
+
+const rowDistance = posZ / p;
+const stepX = rowDistance * (rayDirX1 - rayDirX0) / W;
+const stepY = rowDistance * (rayDirY1 - rayDirY0) / W;
+let floorX = posX + rowDistance * rayDirX0;
+let floorY = posY + rowDistance * rayDirY0;
+
+const tex = isFloor ? floorTex : ceilTex;
+const distFog = Math.max(0.05, 1.0 - rowDistance / 15.0);
+const rowOffset = y * W;
+
+for (let x = 0; x < W; x++) {
+const cellX = floorX | 0;
+const cellY = floorY | 0;
+const tx = ((floorX * TEX_SIZE) | 0) & (TEX_SIZE - 1);
+const ty = ((floorY * TEX_SIZE) | 0) & (TEX_SIZE - 1);
+floorX += stepX;
+floorY += stepY;
+
+const color = tex[(ty << 6) + tx];
+let lr = 0.15, lg = 0.15, lb = 0.2;
+if (cellX >= 0 && cellX < map.width && cellY >= 0 && cellY < map.height) {
+const mIdx = cellY * map.width + cellX;
+lr = map.lightR[mIdx];
+lg = map.lightG[mIdx];
+lb = map.lightB[mIdx];
+}
+
+const r = Math.min(255, ((color & 0xFF) * lr * distFog) | 0);
+const g = Math.min(255, (((color >> 8) & 0xFF) * lg * distFog) | 0);
+const b = Math.min(255, (((color >> 16) & 0xFF) * lb * distFog) | 0);
+buf[rowOffset + x] = (0xFF000000 | (b << 16) | (g << 8) | r) >>> 0;
+}
+}
+
+// ------------------------------------------------------------------------
+// B. WALL DDA RAYCASTING
+// ------------------------------------------------------------------------
+for (let x = 0; x < W; x++) {
+const cameraX = 2 * x / W - 1;
+const rayDirX = dirX + planeX * cameraX;
+const rayDirY = dirY + planeY * cameraX;
+
+let mapX = posX | 0;
+let mapY = posY | 0;
+
+const deltaDistX = Math.abs(1 / (rayDirX || 1e-10));
+const deltaDistY = Math.abs(1 / (rayDirY || 1e-10));
+
+let stepX, sideDistX, stepY, sideDistY;
+if (rayDirX < 0) {
+stepX = -1;
+sideDistX = (posX - mapX) * deltaDistX;
+} else {
+stepX = 1;
+sideDistX = (mapX + 1.0 - posX) * deltaDistX;
+}
+if (rayDirY < 0) {
+stepY = -1;
+sideDistY = (posY - mapY) * deltaDistY;
+} else {
+stepY = 1;
+sideDistY = (mapY + 1.0 - posY) * deltaDistY;
+}
+
+let hit = 0, side = 0, steps = 0;
+while (hit === 0 && steps < 48) {
+if (sideDistX < sideDistY) {
+sideDistX += deltaDistX;
+mapX += stepX;
+side = 0;
+} else {
+sideDistY += deltaDistY;
+mapY += stepY;
+side = 1;
+}
+if (mapX < 0 || mapX >= map.width || mapY < 0 || mapY >= map.height) {
+hit = 1;
+break;
+}
+const cell = map.grid[mapY * map.width + mapX];
+map.explored[mapY * map.width + mapX] = 1;
+if (cell > 0) hit = cell;
+steps++;
+}
+
+const perpWallDist = Math.max(0.05, side === 0
+? (mapX - posX + (1 - stepX) / 2) / rayDirX
+: (mapY - posY + (1 - stepY) / 2) / rayDirY
+);
+this.zBuffer[x] = perpWallDist;
+
+const lineHeight = (H / perpWallDist) | 0;
+let drawStart = Math.max(0, (-lineHeight >> 1) + horizon);
+let drawEnd = Math.min(H - 1, (lineHeight >> 1) + horizon);
+
+let wallX = side === 0 ? (posY + perpWallDist * rayDirY) : (posX + perpWallDist * rayDirX);
+wallX -= Math.floor(wallX);
+let texX = (wallX * TEX_SIZE) | 0;
+if ((side === 0 && rayDirX > 0) || (side === 1 && rayDirY < 0)) {
+texX = TEX_SIZE - texX - 1;
+}
+
+const tex = this.assets.textures[hit] || this.assets.textures[1];
+const step = TEX_SIZE / lineHeight;
+let texPos = (drawStart - horizon + (lineHeight >> 1)) * step;
+
+// Sample Light at the tile immediately in front of the wall face
+const lightSampleX = Math.max(0, Math.min(map.width - 1, side === 0 ? mapX - stepX : mapX));
+const lightSampleY = Math.max(0, Math.min(map.height - 1, side === 1 ? mapY - stepY : mapY));
+const lIdx = lightSampleY * map.width + lightSampleX;
+
+const sideShade = side === 1 ? 0.76 : 1.0;
+const distFog = Math.max(0.04, 1.0 - perpWallDist / 16.0) * sideShade;
+const lr = map.lightR[lIdx] * distFog;
+const lg = map.lightG[lIdx] * distFog;
+const lb = map.lightB[lIdx] * distFog;
+
+for (let y = drawStart; y <= drawEnd; y++) {
+const texY = (texPos | 0) & (TEX_SIZE - 1);
+texPos += step;
+const color = tex[(texY << 6) + texX];
+const r = Math.min(255, ((color & 0xFF) * lr) | 0);
+const g = Math.min(255, (((color >> 8) & 0xFF) * lg) | 0);
+const b = Math.min(255, (((color >> 16) & 0xFF) * lb) | 0);
+buf[y * W + x] = (0xFF000000 | (b << 16) | (g << 8) | r) >>> 0;
+}
+}
+
+// ------------------------------------------------------------------------
+// C. SPRITES & PARTICLESDEPTH SORTING & PROJECTION
+// ------------------------------------------------------------------------
+const renderList = [];
+for (const [id, spr] of ecs.sprite.entries()) {
+const tr = ecs.transform.get(id);
+if (!tr) continue;
+const dx = tr.x - posX;
+const dy = tr.y - posY;
+const distSq = dx * dx + dy * dy;
+if (distSq < 256) {
+const hlth = ecs.health.get(id);
+renderList.push({
+isParticle: false,
+x: tr.x, y: tr.y, z: spr.zOffset,
+distSq,
+texData: spr.texData,
+scale: spr.scale,
+hitFlash: hlth ? hlth.hitFlash : 0,
+unlit: ecs.projectile.has(id) || ecs.pickup.has(id)
+});
+}
+}
+
+for (let i = 0; i < particles.max; i++) {
+if (!particles.active[i]) continue;
+const dx = particles.x[i] - posX;
+const dy = particles.y[i] - posY;
+const distSq = dx * dx + dy * dy;
+if (distSq < 196) {
+renderList.push({
+isParticle: true,
+x: particles.x[i], y: particles.y[i], z: particles.z[i],
+distSq,
+color: particles.color[i],
+size: particles.size[i]
+});
+}
+}
+
+renderList.sort((a, b) => b.distSq - a.distSq);
+
+const invDet = 1.0 / (planeX * dirY - dirX * planeY);
+
+for (let i = 0; i < renderList.length; i++) {
+const item = renderList[i];
+const spriteX = item.x - posX;
+const spriteY = item.y - posY;
+
+const transformX = invDet * (dirY * spriteX - dirX * spriteY);
+const transformY = invDet * (-planeY * spriteX + planeX * spriteY);
+if (transformY <= 0.12) continue;
+
+const spriteScreenX = ((W / 2) * (1 + transformX / transformY)) | 0;
+const vMoveScreen = ((-item.z * H) / transformY) | 0;
+
+if (item.isParticle) {
+const pSize = Math.max(1, ((H / transformY) * item.size) | 0);
+const startX = Math.max(0, spriteScreenX - (pSize >> 1));
+const endX = Math.min(W - 1, spriteScreenX + (pSize >> 1));
+const startY = Math.max(0, horizon + vMoveScreen - (pSize >> 1));
+const endY = Math.min(H - 1, horizon + vMoveScreen + (pSize >> 1));
+
+for (let sx = startX; sx <= endX; sx++) {
+if (transformY >= this.zBuffer[sx]) continue;
+for (let sy = startY; sy <= endY; sy++) {
+buf[sy * W + sx] = item.color;
+}
+}
+continue;
+}
+
+const spriteHeight = Math.abs(((H / transformY) * item.scale) | 0);
+const spriteWidth = spriteHeight;
+if (spriteHeight === 0) continue;
+
+const drawStartY = Math.max(0, (-spriteHeight >> 1) + horizon + vMoveScreen);
+const drawEndY = Math.min(H - 1, (spriteHeight >> 1) + horizon + vMoveScreen);
+const drawStartX = Math.max(0, (-spriteWidth >> 1) + spriteScreenX);
+const drawEndX = Math.min(W - 1, (spriteWidth >> 1) + spriteScreenX);
+
+const cellX = Math.max(0, Math.min(map.width - 1, item.x | 0));
+const cellY = Math.max(0, Math.min(map.height - 1, item.y | 0));
+const lIdx = cellY * map.width + cellX;
+const fog = Math.max(0.1, 1.0 - transformY / 16.0);
+const lr = item.unlit ? 1.0 : Math.min(1.4, map.lightR[lIdx] * fog);
+const lg = item.unlit ? 1.0 : Math.min(1.4, map.lightG[lIdx] * fog);
+const lb = item.unlit ? 1.0 : Math.min(1.4, map.lightB[lIdx] * fog);
+
+const tex = item.texData;
+const flash = item.hitFlash > 0;
+
+for (let stripe = drawStartX; stripe <= drawEndX; stripe++) {
+if (transformY >= this.zBuffer[stripe]) continue;
+const texX = (((stripe - ((-spriteWidth >> 1) + spriteScreenX)) * TEX_SIZE) / spriteWidth) | 0;
+if (texX < 0 || texX >= TEX_SIZE) continue;
+
+for (let y = drawStartY; y <= drawEndY; y++) {
+const d = y - vMoveScreen - horizon + (spriteHeight >> 1);
+const texY = ((d * TEX_SIZE) / spriteHeight) | 0;
+if (texY < 0 || texY >= TEX_SIZE) continue;
+
+const color = tex[(texY << 6) + texX];
+if ((color >>> 24) === 0) continue; // Transparent pixel
+
+if (flash) {
+buf[y * W + stripe] = 0xFFFFFFFF;
+} else {
+const r = Math.min(255, ((color & 0xFF) * lr) | 0);
+const g = Math.min(255, (((color >> 8) & 0xFF) * lg) | 0);
+const b = Math.min(255, (((color >> 16) & 0xFF) * lb) | 0);
+buf[y * W + stripe] = (0xFF000000 | (b << 16) | (g << 8) | r) >>> 0;
+}
+}
+}
+}
+
+this.ctx.putImageData(this.imgData, 0, 0);
+}
+
+renderHUD(player, map, ecs, gameState) {
+const ctx = this.ctx;
+const W = this.width;
+const H = this.height;
+
+// 1. First-Person Weapon Viewmodel
+this.drawWeaponViewmodel(ctx, W, H, player);
+
+// 2. Screen Damage / Pickup Flash Overlays
+if (player.damageFlash > 0) {
+ctx.fillStyle = `rgba(255, 20, 20, ${Math.min(0.55, player.damageFlash)})`;
+ctx.fillRect(0, 0, W, H);
+}
+if (player.bonusFlash > 0) {
+ctx.fillStyle = `rgba(40, 240, 255, ${Math.min(0.35, player.bonusFlash)})`;
+ctx.fillRect(0, 0, W, H);
+}
+
+// 3. Crosshair
+const cx = W >> 1, cy = H >> 1;
+ctx.strokeStyle = '#00ffcc';
+ctx.lineWidth = 1;
+ctx.beginPath();
+ctx.moveTo(cx - 6, cy); ctx.lineTo(cx - 2, cy);
+ctx.moveTo(cx + 2, cy); ctx.lineTo(cx + 6, cy);
+ctx.moveTo(cx, cy - 6); ctx.lineTo(cx, cy - 2);
+ctx.moveTo(cx, cy + 2); ctx.lineTo(cx, cy + 6);
+ctx.stroke();
+
+// 4. Mini-Map (Top Left)
+const mmScale = 3;
+const mmPad = 8;
+ctx.fillStyle = 'rgba(5, 10, 18, 0.78)';
+ctx.fillRect(mmPad - 2, mmPad - 2, map.width * mmScale + 4, map.height * mmScale + 4);
+ctx.strokeStyle = '#00ffcc';
+ctx.strokeRect(mmPad - 2, mmPad - 2, map.width * mmScale + 4, map.height * mmScale + 4);
+
+for (let y = 0; y < map.height; y++) {
+for (let x = 0; x < map.width; x++) {
+const idx = y * map.width + x;
+if (!map.explored[idx]) continue;
+if (map.grid[idx] > 0) {
+ctx.fillStyle = map.grid[idx] === 5 ? '#00ffff' : '#3a5268';
+ctx.fillRect(mmPad + x * mmScale, mmPad + y * mmScale, mmScale, mmScale);
+} else {
+ctx.fillStyle = '#101822';
+ctx.fillRect(mmPad + x * mmScale, mmPad + y * mmScale, mmScale, mmScale);
+}
+}
+}
+
+// Entities on Mini-Map
+for (const [id, tr] of ecs.transform.entries()) {
+const gx = tr.x | 0, gy = tr.y | 0;
+if (!map.explored[gy * map.width + gx]) continue;
+if (ecs.ai.has(id)) {
+ctx.fillStyle = '#ff3333';
+ctx.fillRect(mmPad + tr.x * mmScale - 1, mmPad + tr.y * mmScale - 1, 2, 2);
+} else if (ecs.pickup.has(id)) {
+const pk = ecs.pickup.get(id);
+ctx.fillStyle = pk.kind === 'portal' ? '#00ffff' : '#44ff66';
+ctx.fillRect(mmPad + tr.x * mmScale - 1, mmPad + tr.y * mmScale - 1, 2, 2);
+}
+}
+
+// Player on Mini-Map
+const px = mmPad + player.x * mmScale;
+const py = mmPad + player.y * mmScale;
+ctx.fillStyle = '#ffffff';
+ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
+ctx.strokeStyle = '#00ffcc';
+ctx.beginPath();
+ctx.moveTo(px, py);
+ctx.lineTo(px + Math.cos(player.angle) * 6, py + Math.sin(player.angle) * 6);
+ctx.stroke();
+
+// 5. Bottom Status Bar
+ctx.fillStyle = 'rgba(8, 12, 20, 0.88)';
+ctx.fillRect(0, H - 34, W, 34);
+ctx.strokeStyle = '#00ffcc';
+ctx.beginPath();
+ctx.moveTo(0, H - 34); ctx.lineTo(W, H - 34);
+ctx.stroke();
+
+ctx.font = 'bold 11px Courier New';
+// Health Bar
+ctx.fillStyle = '#88aabb';
+ctx.fillText('VITALITY', 12, H - 20);
+ctx.fillStyle = '#221118';
+ctx.fillRect(12, H - 15, 90, 9);
+const hpPct = Math.max(0, player.hp / player.maxHp);
+ctx.fillStyle = hpPct > 0.35 ? '#00ff88' : '#ff2244';
+ctx.fillRect(12, H - 15, 90 * hpPct, 9);
+ctx.fillStyle = '#ffffff';
+ctx.fillText(`${Math.ceil(player.hp)}%`, 108, H - 7);
+
+// Weapon & Ammo
+const wNames = ['PULSE BLASTER', 'RIOT SCATTERGUN', 'PLASMA RIFLE'];
+ctx.fillStyle = '#88aabb';
+ctx.fillText(`ARMAMENT [1-3]: ${wNames[player.weapon]}`, 155, H - 20);
+ctx.fillStyle = '#ffcc00';
+const ammoText = player.weapon === 0 ? 'INF' : `${player.ammo}`;
+ctx.fillText(`CELLS: ${ammoText}`, 155, H - 7);
+
+// Sector, Enemies & Score
+ctx.fillStyle = '#00ffcc';
+ctx.fillText(`SECTOR: 0${gameState.level}`, 340, H - 20);
+ctx.fillStyle = '#ffffff';
+ctx.fillText(`SCORE: ${gameState.score}`, 340, H - 7);
+
+ctx.fillStyle = '#ff6666';
+ctx.fillText(`HOSTILES: ${gameState.enemiesRemaining}`, W - 95, H - 260);
+if (gameState.enemiesRemaining === 0) {
+ctx.fillStyle = '#00ffff';
+ctx.fillText(`LOCATE PORTAL`, W - 95, H - 246);
+}
+
+// 6. Modal Screens (Start / Pause / GameOver)
+if (gameState.mode !== 'PLAYING') {
+ctx.fillStyle = 'rgba(4, 6, 12, 0.82)';
+ctx.fillRect(0, 0, W, H);
+
+ctx.strokeStyle = '#00ffcc';
+ctx.strokeRect(W / 2 - 155, H / 2 - 78, 310, 156);
+ctx.fillStyle = 'rgba(10, 20, 32, 0.95)';
+ctx.fillRect(W / 2 - 154, H / 2 - 77, 308, 154);
+
+ctx.textAlign = 'center';
+ctx.font = 'bold 20px Courier New';
+ctx.fillStyle = '#00ffcc';
+
+if (gameState.mode === 'MENU') {
+ctx.fillText('NECRO-VOID // 3D', W / 2, H / 2 - 42);
+ctx.font = '11px Courier New';
+ctx.fillStyle = '#ccddee';
+ctx.fillText('WASD: Move & Strafe | Mouse: Aim', W / 2, H / 2 - 14);
+ctx.fillText('Click / Space: Fire | 1-3: Switch Weapon', W / 2, H / 2 + 4);
+ctx.fillText('Eliminate hostiles & enter the Cyan Portal', W / 2, H / 2 + 22);
+ctx.fillStyle = '#ffcc00';
+ctx.font = 'bold 12px Courier New';
+ctx.fillText('[ CLICK ANYWHERE TO INITIALIZE ]', W / 2, H / 2 + 54);
+} else if (gameState.mode === 'PAUSED') {
+ctx.fillText('SYSTEM PAUSED', W / 2, H / 2 - 25);
+ctx.font = '11px Courier New';
+ctx.fillStyle = '#ccddee';
+ctx.fillText('WASD: Move | Mouse: Aim | 1-3: Weapons', W / 2, H / 2 + 5);
+ctx.fillStyle = '#ffcc00';
+ctx.fillText('[ CLICK TO RESUME MISSION ]', W / 2, H / 2 + 40);
+} else if (gameState.mode === 'GAMEOVER') {
+ctx.fillStyle = '#ff3344';
+ctx.fillText('SIGNAL TERMINATED', W / 2, H / 2 - 30);
+ctx.font = '12px Courier New';
+ctx.fillStyle = '#ffffff';
+ctx.fillText(`FINAL SCORE: ${gameState.score} (SECTOR ${gameState.level})`, W / 2, H / 2 + 5);
+ctx.fillStyle = '#ffcc00';
+ctx.fillText('[ CLICK TO REBOOT SYSTEM ]', W / 2, H / 2 + 42);
+}
+ctx.textAlign = 'left';
+}
+}
+
+drawWeaponViewmodel(ctx, W, H, player) {
+const bobX = Math.cos(player.bobPhase * 0.5) * 6 * player.moveSpeedRatio;
+const bobY = Math.abs(Math.sin(player.bobPhase)) * 5 * player.moveSpeedRatio;
+const recoilY = player.kickback * 18;
+const wx = (W >> 1) + bobX;
+const wy = H - 34 + bobY + recoilY;
+
+ctx.save();
+// Muzzle Flash
+if (player.muzzleFlash > 0.15) {
+const grad = ctx.createRadialGradient(wx, wy - 44, 2, wx, wy - 44, 28);
+grad.addColorStop(0, '#ffffff');
+grad.addColorStop(0.4, player.weapon === 2 ? '#00ffff' : '#ffaa22');
+grad.addColorStop(1, 'rgba(255,100,0,0)');
+ctx.fillStyle = grad;
+ctx.beginPath();
+ctx.arc(wx, wy - 44, 28, 0, Math.PI * 2);
+ctx.fill();
+}
+
+// Gun Chassis
+ctx.fillStyle = '#1e2730';
+ctx.beginPath();
+ctx.moveTo(wx - 22, wy);
+ctx.lineTo(wx - 10, wy - 42);
+ctx.lineTo(wx + 10, wy - 42);
+ctx.lineTo(wx + 22, wy);
+ctx.closePath();
+ctx.fill();
+
+// Barrel shroud
+ctx.fillStyle = '#364554';
+ctx.fillRect(wx - 7, wy - 48, 14, 34);
+
+// Glowing Energy Rails
+ctx.fillStyle = player.weapon === 0 ? '#00ffcc' : (player.weapon === 1 ? '#ffaa00' : '#00ccff');
+ctx.fillRect(wx - 3, wy - 45, 6, 26);
+
+ctx.restore();
+}
+}
+
+/**
+* ============================================================================
+* 8. MAIN GAME ENGINE & FIXED-TIMESTEP LOOP
+* ============================================================================
+*/
+class Game {
+constructor() {
+this.canvas = document.getElementById('screen');
+this.assets = new AssetManager();
+this.sound = new SoundEngine();
+this.renderer = new SoftwareRenderer(this.canvas, this.assets);
+this.ecs = new ECS();
+this.spatialGrid = new SpatialHashGrid(2.0);
+this.particles = new ParticlePool(450);
+this.map = new LevelMap(38, 38);
+
+this.keys = {};
+this.mouseDown = false;
+
+this.state = {
+mode: 'MENU', // MENU, PLAYING, PAUSED, GAMEOVER
+level: 1,
+score: 0,
+enemiesRemaining: 0
+};
+
+this.player = {
+x: 3.5, y: 3.5,
+vx: 0, vy: 0,
+angle: 0, pitch: 0,
+radius: 0.3,
+hp: 100, maxHp: 100,
+ammo: 40,
+weapon: 0,
+unlockedWeapons: [true, true, false],
+fireCooldown: 0,
+kickback: 0,
+muzzleFlash: 0,
+damageFlash: 0,
+bonusFlash: 0,
+bobPhase: 0,
+moveSpeedRatio: 0
+};
+
+this.time = 0;
+this.lastFrameTime = performance.now();
+this.accumulator = 0;
+this.fixedDt = 1 / 60;
+
+this.setupInputs();
+this.handleResize();
+window.addEventListener('resize', () => this.handleResize());
+
+this.loadLevel(1, true);
+requestAnimationFrame((t) => this.loop(t));
+}
+
+handleResize() {
+const aspect = 16 / 9;
+let w = window.innerWidth * 0.96;
+let h = window.innerHeight * 0.96;
+if (w / h > aspect) w = h * aspect;
+else h = w / aspect;
+this.canvas.style.width = `${Math.floor(w)}px`;
+this.canvas.style.height = `${Math.floor(h)}px`;
+}
+
+setupInputs() {
+window.addEventListener('keydown', (e) => {
+this.keys[e.code] = true;
+if (e.code === 'Digit1') this.player.weapon = 0;
+if (e.code === 'Digit2' && this.player.unlockedWeapons[1]) this.player.weapon = 1;
+if (e.code === 'Digit3' && this.player.unlockedWeapons[2]) this.player.weapon = 2;
+});
+
+window.addEventListener('keyup', (e) => {
+this.keys[e.code] = false;
+});
+
+this.canvas.addEventListener('mousedown', (e) => {
+if (e.button === 0) this.mouseDown = true;
+this.sound.init();
+
+if (this.state.mode === 'MENU' || this.state.mode === 'PAUSED') {
+this.state.mode = 'PLAYING';
+if (this.canvas.requestPointerLock) this.canvas.requestPointerLock();
+} else if (this.state.mode === 'GAMEOVER') {
+this.loadLevel(1, true);
+this.state.mode = 'PLAYING';
+if (this.canvas.requestPointerLock) this.canvas.requestPointerLock();
+} else if (this.state.mode === 'PLAYING' && document.pointerLockElement !== this.canvas) {
+if (this.canvas.requestPointerLock) this.canvas.requestPointerLock();
+}
+});
+
+window.addEventListener('mouseup', (e) => {
+if (e.button === 0) this.mouseDown = false;
+});
+
+document.addEventListener('pointerlockchange', () => {
+if (document.pointerLockElement !== this.canvas && this.state.mode === 'PLAYING') {
+this.state.mode = 'PAUSED';
+this.mouseDown = false;
+}
+});
+
+window.addEventListener('mousemove', (e) => {
+if (this.state.mode !== 'PLAYING' || document.pointerLockElement !== this.canvas) return;
+this.player.angle += e.movementX * 0.0026;
+this.player.pitch = Math.max(-70, Math.min(70, this.player.pitch - e.movementY * 0.22));
+});
+}
+
+loadLevel(levelNum, resetPlayer = false) {
+this.state.level = levelNum;
+this.ecs.clear();
+this.particles = new ParticlePool(450);
+
+if (resetPlayer) {
+this.state.score = 0;
+this.player.hp = 100;
+this.player.ammo = 45;
+this.player.weapon = 0;
+this.player.unlockedWeapons = [true, true, false];
+}
+
+const start = this.map.generate(levelNum, this.ecs, this.assets);
+this.player.x = start.startX;
+this.player.y = start.startY;
+this.player.vx = 0;
+this.player.vy = 0;
+this.player.angle = 0;
+this.player.pitch = 0;
+}
+
+firePlayerWeapon() {
+const p = this.player;
+if (p.weapon > 0 && p.ammo <= 0) {
+p.weapon = 0; // Auto-fallback to Blaster
+}
+
+if (p.weapon === 0) {
+p.fireCooldown = 0.22;
+this.spawnProjectile(p.x, p.y, p.angle, 13.0, 22, true, 0xFFFFF040);
+} else if (p.weapon === 1) {
+p.ammo = Math.max(0, p.ammo - 2);
+p.fireCooldown = 0.58;
+for (let i = -2; i <= 2; i++) {
+const spread = (i * 0.055) + (Math.random() - 0.5) * 0.03;
+this.spawnProjectile(p.x, p.y, p.angle + spread, 15.0, 18, true, 0xFF30C0FF);
+}
+} else if (p.weapon === 2) {
+p.ammo = Math.max(0, p.ammo - 1);
+p.fireCooldown = 0.11;
+const spread = (Math.random() - 0.5) * 0.04;
+this.spawnProjectile(p.x, p.y, p.angle + spread, 16.5, 20, true, 0xFFFFCC00);
+}
+
+p.kickback = 1.0;
+p.muzzleFlash = 1.0;
+this.sound.sfxShoot(p.weapon);
+}
+
+spawnProjectile(x, y, angle, speed, damage, isPlayer, particleColor) {
+const id = this.ecs.createEntity();
+const dx = Math.cos(angle);
+const dy = Math.sin(angle);
+this.ecs.transform.set(id, {
+x: x + dx * 0.35,
+y: y + dy * 0.35,
+z: 0,
+dirX: dx, dirY: dy,
+radius: 0.15
+});
+this.ecs.velocity.set(id, { vx: dx * speed, vy: dy * speed, speed });
+this.ecs.sprite.set(id, {
+texData: isPlayer ? this.assets.sprites.projPlayer : this.assets.sprites.projEnemy,
+scale: 0.32,
+zOffset: -0.05
+});
+this.ecs.projectile.set(id, {
+owner: isPlayer ? 'player' : 'enemy',
+damage,
+life: 2.2,
+color: particleColor
+});
+this.ecs.light.set(id, {
+r: isPlayer ? 0.2 : 1.0,
+g: isPlayer ? 0.85 : 0.35,
+b: isPlayer ? 1.0 : 0.1,
+radius: 3.2,
+flicker: false
+});
+}
+
+moveWithWallSlide(entityTransform, dx, dy) {
+const r = entityTransform.radius;
+const nx = entityTransform.x + dx;
+const ny = entityTransform.y + dy;
+
+const canMoveX = !this.map.isSolid((nx + r) | 0, (entityTransform.y + r) | 0) &&
+!this.map.isSolid((nx - r) | 0, (entityTransform.y + r) | 0) &&
+!this.map.isSolid((nx + r) | 0, (entityTransform.y - r) | 0) &&
+!this.map.isSolid((nx - r) | 0, (entityTransform.y - r) | 0);
+if (canMoveX) entityTransform.x = nx;
+
+const canMoveY = !this.map.isSolid((entityTransform.x + r) | 0, (ny + r) | 0) &&
+!this.map.isSolid((entityTransform.x - r) | 0, (ny + r) | 0) &&
+!this.map.isSolid((entityTransform.x + r) | 0, (ny - r) | 0) &&
+!this.map.isSolid((entityTransform.x - r) | 0, (ny - r) | 0);
+if (canMoveY) entityTransform.y = ny;
+
+return canMoveX && canMoveY;
+}
+
+fixedUpdate(dt) {
+this.sound.updateMusic();
+if (this.state.mode !== 'PLAYING') return;
+
+this.time += dt;
+const p = this.player;
+
+// 1. Player Keyboard Turning & Smooth Movement
+if (this.keys['ArrowLeft']) p.angle -= 2.4 * dt;
+if (this.keys['ArrowRight']) p.angle += 2.4 * dt;
+
+const forwardX = Math.cos(p.angle);
+const forwardY = Math.sin(p.angle);
+const rightX = -forwardY;
+const rightY = forwardX;
+
+let moveX = 0, moveY = 0;
+if (this.keys['KeyW'] || this.keys['ArrowUp']) { moveX += forwardX; moveY += forwardY; }
+if (this.keys['KeyS'] || this.keys['ArrowDown']) { moveX -= forwardX; moveY -= forwardY; }
+if (this.keys['KeyD']) { moveX += rightX; moveY += rightY; }
+if (this.keys['KeyA']) { moveX -= rightX; moveY -= rightY; }
+
+const mag = Math.hypot(moveX, moveY);
+if (mag > 0) {
+moveX /= mag;
+moveY /= mag;
+}
+
+const maxSpeed = 4.6;
+p.vx += (moveX * maxSpeed - p.vx) * Math.min(1, dt * 12);
+p.vy += (moveY * maxSpeed - p.vy) * Math.min(1, dt * 12);
+this.moveWithWallSlide(p, p.vx * dt, p.vy * dt);
+
+const curSpeed = Math.hypot(p.vx, p.vy);
+p.moveSpeedRatio = curSpeed / maxSpeed;
+p.bobPhase += curSpeed * dt * 2.8;
+
+// Cooldowns & Decays
+p.fireCooldown = Math.max(0, p.fireCooldown - dt);
+p.kickback = Math.max(0, p.kickback - dt * 5.0);
+p.muzzleFlash = Math.max(0, p.muzzleFlash - dt * 8.0);
+p.damageFlash = Math.max(0, p.damageFlash - dt * 2.2);
+p.bonusFlash = Math.max(0, p.bonusFlash - dt * 2.5);
+
+if ((this.mouseDown || this.keys['Space']) && p.fireCooldown <= 0) {
+this.firePlayerWeapon();
+}
+
+// 2. Rebuild Spatial Partitioning Hash Grid
+this.spatialGrid.clear();
+for (const [id, col] of this.ecs.collider.entries()) {
+const tr = this.ecs.transform.get(id);
+if (tr) this.spatialGrid.insert(id, tr.x, tr.y, tr.radius);
+}
+
+// 3. Update AI Entities (Finite State Machine: PATROL -> SEEK -> ATTACK -> EVADE)
+let activeEnemies = 0;
+for (const [id, ai] of this.ecs.ai.entries()) {
+activeEnemies++;
+const tr = this.ecs.transform.get(id);
+const vel = this.ecs.velocity.get(id);
+const hlth = this.ecs.health.get(id);
+if (!tr || !vel || !hlth) continue;
+
+if (hlth.hitFlash > 0) hlth.hitFlash = Math.max(0, hlth.hitFlash - dt);
+ai.timer -= dt;
+ai.cooldown = Math.max(0, ai.cooldown - dt);
+
+const dx = p.x - tr.x;
+const dy = p.y - tr.y;
+const distToPlayer = Math.hypot(dx, dy);
+const canSee = distToPlayer < 13.0 && this.map.hasLineOfSight(tr.x, tr.y, p.x, p.y);
+
+if (hlth.hp < hlth.maxHp * 0.25 && ai.state !== 'EVADE' && Math.random() < 0.05) {
+ai.state = 'EVADE';
+ai.timer = 1.2;
+} else if (canSee) {
+if (distToPlayer < (ai.type === 'stalker' ? 2.2 : 6.0)) {
+ai.state = 'ATTACK';
+} else {
+ai.state = 'SEEK';
+}
+} else if (ai.state !== 'PATROL' && ai.timer <= 0) {
+ai.state = 'PATROL';
+}
+
+if (ai.state === 'PATROL') {
+if (ai.timer <= 0) {
+const ang = Math.random() * Math.PI * 2;
+tr.dirX = Math.cos(ang);
+tr.dirY = Math.sin(ang);
+ai.timer = 1.5 + Math.random() * 2.0;
+}
+const moved = this.moveWithWallSlide(tr, tr.dirX * vel.speed * 0.45 * dt, tr.dirY * vel.speed * 0.45 * dt);
+if (!moved) ai.timer = 0;
+} else if (ai.state === 'SEEK') {
+const nx = dx / (distToPlayer || 1);
+const ny = dy / (distToPlayer || 1);
+this.moveWithWallSlide(tr, nx * vel.speed * dt, ny * vel.speed * dt);
+tr.dirX = nx; tr.dirY = ny;
+} else if (ai.state === 'EVADE') {
+const nx = -dx / (distToPlayer || 1);
+const ny = -dy / (distToPlayer || 1);
+this.moveWithWallSlide(tr, nx * vel.speed * dt, ny * vel.speed * dt);
+if (ai.timer <= 0) ai.state = 'SEEK';
+} else if (ai.state === 'ATTACK') {
+// Strafe around player while attacking
+const strafeX = -dy / (distToPlayer || 1);
+const strafeY = dx / (distToPlayer || 1);
+const dirSign = (id & 1) ? 1 : -1;
+this.moveWithWallSlide(tr, strafeX * dirSign * vel.speed * 0.6 * dt, strafeY * dirSign * vel.speed * 0.6 * dt);
+
+if (ai.cooldown <= 0 && canSee) {
+const aimAngle = Math.atan2(dy, dx);
+if (ai.type === 'stalker' && distToPlayer < 1.3) {
+// Melee strike
+p.hp -= 14;
+p.damageFlash = 0.65;
+this.sound.sfxHit();
+ai.cooldown = 0.85;
+} else {
+// Ranged plasma bolt
+this.spawnProjectile(tr.x, tr.y, aimAngle, 7.5, ai.type === 'boss' ? 18 : 11, false, 0xFF2060FF);
+if (ai.type === 'boss') {
+this.spawnProjectile(tr.x, tr.y, aimAngle - 0.16, 7.5, 14, false, 0xFF2060FF);
+this.spawnProjectile(tr.x, tr.y, aimAngle + 0.16, 7.5, 14, false, 0xFF2060FF);
+}
+ai.cooldown = ai.type === 'boss' ? 1.1 : 1.45;
+}
+}
+}
+
+// Soft separation between nearby entities
+const nearby = this.spatialGrid.query(tr.x, tr.y, tr.radius * 2.2);
+for (const otherId of nearby) {
+if (otherId === id) continue;
+const otr = this.ecs.transform.get(otherId);
+const ocol = this.ecs.collider.get(otherId);
+if (!otr || !ocol || !ocol.solid) continue;
+const sdx = tr.x - otr.x;
+const sdy = tr.y - otr.y;
+const dist = Math.hypot(sdx, sdy);
+const minDist = tr.radius + otr.radius;
+if (dist > 0.001 && dist < minDist) {
+const push = (minDist - dist) * 0.5;
+this.moveWithWallSlide(tr, (sdx / dist) * push, (sdy / dist) * push);
+}
+}
+}
+this.state.enemiesRemaining = activeEnemies;
+
+// 4. Update Projectiles & Fast Spatial Collision Detection
+for (const [id, proj] of this.ecs.projectile.entries()) {
+const tr = this.ecs.transform.get(id);
+const vel = this.ecs.velocity.get(id);
+if (!tr || !vel) continue;
+
+proj.life -= dt;
+if (proj.life <= 0) {
+this.ecs.destroyEntity(id);
+continue;
+}
+
+const nx = tr.x + vel.vx * dt;
+const ny = tr.y + vel.vy * dt;
+
+// Wall impact check
+if (this.map.isSolid(nx | 0, ny | 0)) {
+this.particles.burst(tr.x, tr.y, 0, 10, proj.color, 2.2, 0.06);
+this.ecs.destroyEntity(id);
+continue;
+}
+tr.x = nx;
+tr.y = ny;
+
+if (proj.owner === 'player') {
+const candidates = this.spatialGrid.query(tr.x, tr.y, tr.radius + 0.5);
+for (const targetId of candidates) {
+const col = this.ecs.collider.get(targetId);
+if (!col || !col.isEnemy) continue;
+const tTr = this.ecs.transform.get(targetId);
+if (!tTr) continue;
+if (Math.hypot(tr.x - tTr.x, tr.y - tTr.y) < tr.radius + tTr.radius) {
+const hlth = this.ecs.health.get(targetId);
+if (hlth) {
+hlth.hp -= proj.damage;
+hlth.hitFlash = 0.1;
+this.particles.burst(tr.x, tr.y, 0, 12, 0xFF3322FF, 2.8, 0.08);
+this.sound.sfxHit();
+
+// Wake enemy up immediately on hit
+const ai = this.ecs.ai.get(targetId);
+if (ai) ai.state = 'SEEK';
+
+if (hlth.hp <= 0) {
+this.state.score += ai ? ai.score : 100;
+this.particles.burst(tTr.x, tTr.y, 0, 32, 0xFF2255FF, 3.8, 0.12);
+this.sound.sfxExplosion();
+this.ecs.destroyEntity(targetId);
+}
+}
+this.ecs.destroyEntity(id);
+break;
+}
+}
+} else {
+// Enemy projectile hitting player
+if (Math.hypot(tr.x - p.x, tr.y - p.y) < tr.radius + p.radius) {
+p.hp -= proj.damage;
+p.damageFlash = 0.7;
+this.particles.burst(tr.x, tr.y, 0, 12, 0xFF2244FF, 2.5, 0.07);
+this.sound.sfxHit();
+this.ecs.destroyEntity(id);
+}
+}
+}
+
+// 5. Player Pickup Collection
+const playerNearby = this.spatialGrid.query(p.x, p.y, p.radius + 0.5);
+for (const id of playerNearby) {
+const pk = this.ecs.pickup.get(id);
+const tr = this.ecs.transform.get(id);
+if (!pk || !tr) continue;
+
+if (Math.hypot(p.x - tr.x, p.y - tr.y) < p.radius + tr.radius) {
+if (pk.kind === 'health' && p.hp < p.maxHp) {
+p.hp = Math.min(p.maxHp, p.hp + pk.value);
+p.bonusFlash = 0.5;
+this.sound.sfxPickup();
+this.ecs.destroyEntity(id);
+} else if (pk.kind === 'ammo') {
+p.ammo += pk.value;
+p.bonusFlash = 0.5;
+this.sound.sfxPickup();
+this.ecs.destroyEntity(id);
+} else if (pk.kind === 'weapon') {
+p.unlockedWeapons[2] = true;
+p.weapon = 2;
+p.ammo += 35;
+p.bonusFlash = 0.7;
+this.sound.sfxPickup();
+this.ecs.destroyEntity(id);
+} else if (pk.kind === 'portal') {
+this.sound.sfxPickup();
+this.state.score += 250 * this.state.level;
+this.loadLevel(this.state.level + 1, false);
+return;
+}
+}
+}
+
+// Check Player Death
+if (p.hp <= 0) {
+p.hp = 0;
+this.state.mode = 'GAMEOVER';
+if (document.exitPointerLock) document.exitPointerLock();
+}
+
+// 6. Update Particles & Flush Destroyed ECS Entities
+this.particles.update(dt, this.map);
+this.ecs.flushDestroyed();
+}
+
+loop(now) {
+const frameTime = Math.min(0.1, (now - this.lastFrameTime) / 1000);
+this.lastFrameTime = now;
+this.accumulator += frameTime;
+
+while (this.accumulator >= this.fixedDt) {
+this.fixedUpdate(this.fixedDt);
+this.accumulator -= this.fixedDt;
+}
+
+// Bake Dynamic Lighting & Render 3D Scene + HUD
+this.map.bakeLighting(this.ecs, this.player, this.player.muzzleFlash, this.time);
+this.renderer.renderWorld(this.player, this.map, this.ecs, this.particles, this.time);
+this.renderer.renderHUD(this.player, this.map, this.ecs, this.state);
+
+requestAnimationFrame((t) => this.loop(t));
+}
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+new Game();
+});
+</script>
+</body>
+</html>
